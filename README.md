@@ -18,6 +18,18 @@ High-performance, multi-threaded CPU miner for **Reticulum AI ($RAIX)** built fr
 
 ---
 
+## 📥 Precompiled Binaries (Ready to Run)
+
+No compilation or build tools required — download the standalone package for your operating system:
+
+| Platform | Architecture | Download Link | Quick Launch |
+| :--- | :--- | :--- | :--- |
+| **Windows** | x86_64 / x64 | [📥 powgrid-raix-cpu-miner-windows-x64.zip](https://raix.powgrid.xyz/downloads/powgrid-raix-cpu-miner-windows-x64.zip) | Double-click `start_mining.bat` |
+| **Linux** | x86_64 | [📥 powgrid-raix-cpu-miner-linux-x64.tar.gz](https://raix.powgrid.xyz/downloads/powgrid-raix-cpu-miner-linux-x64.tar.gz) | `./powgrid-raix-cpu-miner` |
+| **macOS** | Apple Silicon & Intel | [📥 powgrid-raix-miner-macos.zip](https://raix.powgrid.xyz/downloads/powgrid-raix-miner-macos.zip) | `./powgrid-raix-miner` |
+
+---
+
 ## Building from Source
 
 ### 1. Prerequisites
