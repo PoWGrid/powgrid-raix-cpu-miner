@@ -1,6 +1,6 @@
 [package]
 name = "powgrid-raix-cpu-miner"
-version = "1.1.0"
+version = "2.1.0"
 edition = "2021"
 authors = ["PowGrid Community Developers"]
 description = "Multi-core AVX2 and SHA-NI accelerated RandomX CPU miner for Reticulum AI ($RAIX)"
@@ -14,6 +14,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 ureq = { version = "2.9", features = ["json"] }
 libc = "0.2"
+aes = "0.8"
+ctr = "0.9"
 
 [profile.release]
 opt-level = 3

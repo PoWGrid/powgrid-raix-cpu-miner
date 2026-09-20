@@ -8,6 +8,9 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
+use aes::cipher::{KeyIvInit, StreamCipher};
+
+type Aes256Ctr128BE = ctr::Ctr128BE<aes::Aes256>;
 
 // Signal handler to restore terminal cursor on Ctrl+C / SIGINT
 extern "C" fn sigint_handler(_: libc::c_int) {
@@ -148,6 +151,7 @@ impl EventLogger {
 
 #[derive(Clone)]
 pub struct PrecomputedSeed {
+    pub is_v2: bool,
     pub seed: Vec<u8>,
     pub colon_seed: Vec<u8>,
     pub seed_colon_hasher: Sha512,
@@ -155,6 +159,9 @@ pub struct PrecomputedSeed {
 
 impl PrecomputedSeed {
     pub fn new(seed: &[u8]) -> Self {
+        let is_v2 = seed.windows(2).any(|w| w == b"v2")
+            || seed.windows(20).any(|w| w == b"reticulum-randomx-v2");
+
         let mut colon_seed = Vec::with_capacity(seed.len() + 1);
         colon_seed.push(b':');
         colon_seed.extend_from_slice(seed);
@@ -164,6 +171,7 @@ impl PrecomputedSeed {
         hasher.update(b":");
 
         Self {
+            is_v2,
             seed: seed.to_vec(),
             colon_seed,
             seed_colon_hasher: hasher,
@@ -174,33 +182,71 @@ impl PrecomputedSeed {
 pub struct CortexRandomX;
 
 impl CortexRandomX {
+    pub const FORK_BLOCK_HEIGHT: u64 = 36040;
+    pub const SCRATCHPAD_WORDS_V1: usize = 4096;   // 32 KB
+    pub const SCRATCHPAD_WORDS_V2: usize = 262144; // 2 MB
+    pub const VM_ITERATIONS_V1: usize = 64;
+    pub const VM_ITERATIONS_V2: usize = 128;
+    pub const EPOCH_BLOCKS: u64 = 2048;
+
+    pub fn get_seed_for_block(block_index: u64) -> String {
+        let epoch = block_index / Self::EPOCH_BLOCKS;
+        if block_index >= Self::FORK_BLOCK_HEIGHT {
+            format!("reticulum-randomx-v2-epoch-{}", epoch)
+        } else {
+            format!("cortex-randomx-epoch-{}", epoch)
+        }
+    }
+
     #[inline(always)]
-    pub fn hash(header: &[u8], seed: &[u8], scratchpad: &mut [i64; 4096]) -> [u8; 32] {
+    pub fn hash(header: &[u8], seed: &[u8], scratchpad: &mut [i64]) -> [u8; 32] {
         let precomputed = PrecomputedSeed::new(seed);
         Self::hash_fast(header, &precomputed, scratchpad)
     }
 
     #[inline(always)]
-    pub fn hash_fast(header: &[u8], precomputed: &PrecomputedSeed, scratchpad: &mut [i64; 4096]) -> [u8; 32] {
+    pub fn hash_fast(header: &[u8], precomputed: &PrecomputedSeed, scratchpad: &mut [i64]) -> [u8; 32] {
+        let is_v2 = precomputed.is_v2;
+        let words = if is_v2 { Self::SCRATCHPAD_WORDS_V2 } else { Self::SCRATCHPAD_WORDS_V1 };
+        let iterations = if is_v2 { Self::VM_ITERATIONS_V2 } else { Self::VM_ITERATIONS_V1 };
+
         // Step 1: Initialize Scratchpad using Seed & Header
-        let mut hasher = Sha512::new();
-        hasher.update(header);
-        hasher.update(&precomputed.colon_seed);
-        let mut key: [u8; 64] = hasher.finalize().into();
+        if !is_v2 {
+            let mut hasher = Sha512::new();
+            hasher.update(header);
+            hasher.update(&precomputed.colon_seed);
+            let mut key: [u8; 64] = hasher.finalize().into();
 
-        for blk in 0..64 {
-            let base = blk * 64;
-            let key_words: [i64; 8] = unsafe { std::mem::transmute(key) };
-            scratchpad[base..base + 8].copy_from_slice(&key_words);
+            for blk in 0..64 {
+                let base = blk * 64;
+                let key_words: [i64; 8] = unsafe { std::mem::transmute(key) };
+                scratchpad[base..base + 8].copy_from_slice(&key_words);
 
-            let mut k_hasher = Sha512::new();
-            k_hasher.update(&key);
-            key = k_hasher.finalize().into();
-            let next_words: [i64; 8] = unsafe { std::mem::transmute(key) };
+                let mut k_hasher = Sha512::new();
+                k_hasher.update(&key);
+                key = k_hasher.finalize().into();
+                let next_words: [i64; 8] = unsafe { std::mem::transmute(key) };
 
-            for chunk in 1..8 {
-                scratchpad[base + chunk * 8..base + chunk * 8 + 8].copy_from_slice(&next_words);
+                for chunk in 1..8 {
+                    scratchpad[base + chunk * 8..base + chunk * 8 + 8].copy_from_slice(&next_words);
+                }
             }
+        } else {
+            // v2.1: Native AES-256-CTR keystream expansion (encrypting 2MB zeroes)
+            let mut seed_hasher = Sha256::new();
+            seed_hasher.update(header);
+            seed_hasher.update(b":");
+            seed_hasher.update(&precomputed.seed);
+            let seed_key: [u8; 32] = seed_hasher.finalize().into();
+
+            let iv = [0u8; 16];
+            let mut cipher = Aes256Ctr128BE::new(&seed_key.into(), &iv.into());
+
+            let scratchpad_bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(scratchpad.as_mut_ptr() as *mut u8, words * 8)
+            };
+            scratchpad_bytes.fill(0);
+            cipher.apply_keystream(scratchpad_bytes);
         }
 
         // Step 2: Initialize Registers
@@ -215,15 +261,16 @@ impl CortexRandomX {
             f[i] = (r[i] % 1_000_000) as f64 / 1000.0;
         }
 
-        // Step 3: Random Instruction VM Execution Loop (64 cycles)
+        // Step 3: Random Instruction VM Execution Loop
+        let mask = words - 1;
         let seed = &precomputed.seed;
         let seed_len = seed.len();
 
-        for iter in 0..64usize {
-            let op_code = (initial_digest[iter] ^ seed[iter % seed_len]) % 10;
+        for iter in 0..iterations {
+            let op_code = (initial_digest[iter % 64] ^ seed[iter % seed_len]) % 10;
             let src_idx = (iter + 1) & 7;
             let dst_idx = iter & 7;
-            let mem_idx = (r[dst_idx] as usize) & 4095;
+            let mem_idx = ((r[dst_idx] as u32) as usize) & mask;
 
             match op_code {
                 0 => {
@@ -262,7 +309,7 @@ impl CortexRandomX {
                     r[dst_idx] ^= v;
                 }
                 8 => {
-                    let next_mem = (mem_idx + 64) & 4095;
+                    let next_mem = (mem_idx + 64) & mask;
                     let temp = scratchpad[mem_idx];
                     scratchpad[mem_idx] = scratchpad[next_mem];
                     scratchpad[next_mem] = temp;
@@ -458,7 +505,7 @@ fn main() {
                     let stop_flag = Arc::clone(&stop_flag);
 
                     handles.push(std::thread::spawn(move || {
-                        let mut scratchpad = [0i64; 4096];
+                        let mut scratchpad = vec![0i64; CortexRandomX::SCRATCHPAD_WORDS_V2];
                         let mut nonce = base_nonce.wrapping_add((t as u64).wrapping_mul(10_000_000));
                         let mut local_hashes = 0u64;
 
@@ -521,14 +568,14 @@ fn main() {
     }
 
     println!("===========================================================");
-    println!("  ⚡ PowGrid Reticulum AI ($RAIX) High-Performance CPU Miner v1.1");
+    println!("  ⚡ PowGrid Reticulum AI ($RAIX) High-Performance CPU Miner v2.1");
     println!("  Threads Allocated   : {}", num_threads);
-    println!("  Micro-Architecture  : AVX2 + Hardware SHA-NI Accelerated");
-    println!("  L1 Cache Scratchpad : 32 KB per-thread (Zero RAM Access)");
+    println!("  Micro-Architecture  : AVX2 + Hardware SHA-NI + AES-NI Accelerated");
+    println!("  RandomX Hard Fork   : Dual v1 (32KB) & v2.1 (2MB AES-CTR Keystream)");
     println!("===========================================================\n");
 
-    // Self-test: Canonical Genesis Vector (Nonce 123) & High-Nonce Vector (Nonce 99999)
-    let mut test_scratchpad = [0i64; 4096];
+    // Self-test: Canonical Genesis Vector (Nonce 123), High-Nonce Vector (Nonce 99999), and v2.1 Vector
+    let mut test_scratchpad = vec![0i64; CortexRandomX::SCRATCHPAD_WORDS_V2];
     let test_header = b"test_header_123";
     let test_seed = b"cortex-randomx-genesis-seed-v1";
     let test_hash = CortexRandomX::hash(test_header, test_seed, &mut test_scratchpad);
@@ -540,11 +587,17 @@ fn main() {
     let test_hex_99k = hex::encode(test_hash_99k);
     let expected_99999 = "912f8cb7ed73773658af2f4212aa40bb365d1a5a208eb09cd66e567b3cf70a5c";
 
+    let test_v2_header = b"test_header";
+    let test_v2_seed = b"reticulum-randomx-v2-epoch-17";
+    let test_v2_hash = CortexRandomX::hash(test_v2_header, test_v2_seed, &mut test_scratchpad);
+    let test_v2_hex = hex::encode(test_v2_hash);
+    let expected_v2 = "896e700fe13c24909b95c77e833a2dc0492ed4cbcd2c296bcb387b55e46ee4f6";
+
     print!("[SELF-TEST] Cryptographic L1 accuracy check: ");
-    if test_hex == expected_123 && test_hex_99k == expected_99999 {
-        println!("✅ 100% BIT-PERFECT MATCH (Vectors 123 & 99999)\n");
+    if test_hex == expected_123 && test_hex_99k == expected_99999 && test_v2_hex == expected_v2 {
+        println!("✅ 100% BIT-PERFECT MATCH (v1 & v2.1 Hard Fork Vectors)\n");
     } else {
-        println!("❌ MISMATCH!\n  Expected 123: {}\n  Got: {}\n  Expected 99k: {}\n  Got: {}", expected_123, test_hex, expected_99999, test_hex_99k);
+        println!("❌ MISMATCH!\n  Expected 123: {}\n  Got: {}\n  Expected 99k: {}\n  Got: {}\n  Expected v2: {}\n  Got: {}", expected_123, test_hex, expected_99999, test_hex_99k, expected_v2, test_v2_hex);
         std::process::exit(1);
     }
 
@@ -852,8 +905,8 @@ fn main() {
             h.update(&now_nanos.to_le_bytes());
             let seed_bytes = h.finalize();
             let base_nonce = u64::from_le_bytes(seed_bytes[0..8].try_into().unwrap());
-            let mut nonce = (base_nonce & 0x0000_ffff_ffff_ffff) | ((tid as u64) << 48);
-            let mut scratchpad = [0i64; 4096];
+            let mut nonce = (base_nonce & 0x0000_00ff_ffff_ffff) | ((tid as u64 & 0x1f) << 40);
+            let mut scratchpad = vec![0i64; CortexRandomX::SCRATCHPAD_WORDS_V2];
 
             let mut cur_job_id = String::new();
             let mut prefix = Vec::new();
@@ -963,8 +1016,8 @@ fn run_benchmark(num_threads: usize, bench_secs: u64) {
     let shares_found = Arc::new(AtomicU32::new(0));
     let running = Arc::new(AtomicBool::new(true));
 
-    let base_header = "125000:0000000000abcdef1234567890:1789260000:merkle123:mem123:6:".as_bytes().to_vec();
-    let seed = b"cortex-randomx-epoch-0".to_vec();
+    let base_header = "36042:0000000000abcdef1234567890:1789260000:merkle123:mem123:6:".as_bytes().to_vec();
+    let seed = b"reticulum-randomx-v2-epoch-17".to_vec();
 
     let mut handles = Vec::new();
     let start_time = Instant::now();
@@ -979,7 +1032,7 @@ fn run_benchmark(num_threads: usize, bench_secs: u64) {
         let precomputed = precomputed.clone();
 
         handles.push(thread::spawn(move || {
-            let mut scratchpad = [0i64; 4096];
+            let mut scratchpad = vec![0i64; CortexRandomX::SCRATCHPAD_WORDS_V2];
             let mut nonce = (tid as u64 + 1) * 100_000_000_000;
 
             let mut header_buf = [0u8; 1024];
@@ -988,7 +1041,7 @@ fn run_benchmark(num_threads: usize, bench_secs: u64) {
             let s_len = suffix.len();
 
             while running.load(Ordering::Relaxed) {
-                for _ in 0..500 {
+                for _ in 0..250 {
                     let n_len = write_u64_ascii(nonce, &mut header_buf[p_len..]);
                     header_buf[p_len + n_len..p_len + n_len + s_len].copy_from_slice(suffix);
                     let total_len = p_len + n_len + s_len;
@@ -1000,7 +1053,7 @@ fn run_benchmark(num_threads: usize, bench_secs: u64) {
                     }
                     nonce += 1;
                 }
-                total_hashes.fetch_add(500, Ordering::Relaxed);
+                total_hashes.fetch_add(250, Ordering::Relaxed);
             }
         }));
     }
@@ -1058,7 +1111,7 @@ mod tests {
 
     #[test]
     fn test_canonical_genesis_vector_nonce_123() {
-        let mut scratchpad = [0i64; 4096];
+        let mut scratchpad = vec![0i64; CortexRandomX::SCRATCHPAD_WORDS_V1];
         let header = b"test_header_123";
         let seed = b"cortex-randomx-genesis-seed-v1";
         let hash = CortexRandomX::hash(header, seed, &mut scratchpad);
@@ -1068,11 +1121,21 @@ mod tests {
 
     #[test]
     fn test_canonical_high_nonce_vector_99999() {
-        let mut scratchpad = [0i64; 4096];
+        let mut scratchpad = vec![0i64; CortexRandomX::SCRATCHPAD_WORDS_V1];
         let header = b"test_header_99999";
         let seed = b"cortex-randomx-genesis-seed-v1";
         let hash = CortexRandomX::hash(header, seed, &mut scratchpad);
         let expected = "912f8cb7ed73773658af2f4212aa40bb365d1a5a208eb09cd66e567b3cf70a5c";
         assert_eq!(hex::encode(hash), expected, "High-nonce vector mismatch!");
+    }
+
+    #[test]
+    fn test_v2_exact_vector() {
+        let mut scratchpad = vec![0i64; CortexRandomX::SCRATCHPAD_WORDS_V2];
+        let header = b"test_header";
+        let seed = b"reticulum-randomx-v2-epoch-17";
+        let hash = CortexRandomX::hash(header, seed, &mut scratchpad);
+        let expected = "896e700fe13c24909b95c77e833a2dc0492ed4cbcd2c296bcb387b55e46ee4f6";
+        assert_eq!(hex::encode(hash), expected, "v2.1 vector mismatch!");
     }
 }
