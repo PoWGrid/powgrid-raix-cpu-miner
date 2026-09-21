@@ -12,9 +12,15 @@ use aes::cipher::{BlockEncrypt, KeyInit, KeyIvInit, StreamCipher};
 
 type Aes256Ctr128BE = ctr::Ctr128BE<aes::Aes256>;
 
-// Signal handler to restore terminal cursor on Ctrl+C / SIGINT
+static RESIZE_EVENT: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn sigwinch_handler(_: libc::c_int) {
+    RESIZE_EVENT.store(true, Ordering::Relaxed);
+}
+
+// Signal handler to restore terminal and exit alternate screen on Ctrl+C / SIGINT
 extern "C" fn sigint_handler(_: libc::c_int) {
-    print!("\x1b[?25h\x1b[0m\n\n  \x1b[1;33m[SHUTDOWN]\x1b[0m Miner stopped safely. Terminal restored.\n\n");
+    print!("\x1b[?7h\x1b[?25h\x1b[?1049l\x1b[0m\n\n  \x1b[1;33m[SHUTDOWN]\x1b[0m Miner stopped safely. Terminal restored.\n\n");
     let _ = io::stdout().flush();
     std::process::exit(0);
 }
@@ -156,6 +162,7 @@ pub struct PrecomputedSeed {
     pub seed: Vec<u8>,
     pub colon_seed: Vec<u8>,
     pub seed_colon_hasher: Sha512,
+    pub seed_colon_sha256: Sha256,
 }
 
 impl PrecomputedSeed {
@@ -171,16 +178,21 @@ impl PrecomputedSeed {
         colon_seed.push(b':');
         colon_seed.extend_from_slice(seed);
 
-        let mut hasher = Sha512::new();
-        hasher.update(seed);
-        hasher.update(b":");
+        let mut hasher512 = Sha512::new();
+        hasher512.update(seed);
+        hasher512.update(b":");
+
+        let mut hasher256 = Sha256::new();
+        hasher256.update(seed);
+        hasher256.update(b":");
 
         Self {
             is_v22,
             is_v2,
             seed: seed.to_vec(),
             colon_seed,
-            seed_colon_hasher: hasher,
+            seed_colon_hasher: hasher512,
+            seed_colon_sha256: hasher256,
         }
     }
 }
@@ -219,6 +231,9 @@ impl CortexRandomX {
         let is_v2 = precomputed.is_v2;
         let words = if is_v2 { Self::SCRATCHPAD_WORDS_V2 } else { Self::SCRATCHPAD_WORDS_V1 };
         let iterations = if is_v2 { Self::VM_ITERATIONS_V2 } else { Self::VM_ITERATIONS_V1 };
+        let sp_ptr = scratchpad.as_mut_ptr();
+
+        let mut fold64 = [0i64; 64];
 
         // Step 1: Initialize Scratchpad using Seed & Header
         if !is_v2 {
@@ -245,13 +260,10 @@ impl CortexRandomX {
             // v2.2 Titan-CPU Hardware AES-256-CBC Chained Sequential Fill
             let mut seed_hasher = Sha256::new();
             seed_hasher.update(header);
-            seed_hasher.update(b":");
-            seed_hasher.update(&precomputed.seed);
+            seed_hasher.update(&precomputed.colon_seed);
             let seed_key: [u8; 32] = seed_hasher.finalize().into();
 
-            let mut iv_hasher = Sha256::new();
-            iv_hasher.update(&precomputed.seed);
-            iv_hasher.update(b":");
+            let mut iv_hasher = precomputed.seed_colon_sha256.clone();
             iv_hasher.update(header);
             iv_hasher.update(b":v2.2-iv");
             let iv_full: [u8; 32] = iv_hasher.finalize().into();
@@ -259,13 +271,23 @@ impl CortexRandomX {
 
             let cipher = aes::Aes256::new(&seed_key.into());
             let mut block = aes::Block::from(iv);
+            let sp_ptr = scratchpad.as_mut_ptr();
 
-            for b in 0..131072 {
-                cipher.encrypt_block(&mut block);
-                let w0 = i64::from_le_bytes(block[0..8].try_into().unwrap());
-                let w1 = i64::from_le_bytes(block[8..16].try_into().unwrap());
-                scratchpad[b * 2] = w0;
-                scratchpad[b * 2 + 1] = w1;
+            // 131,072 blocks = 4,096 cycles of 32 blocks (64 words = 512 bytes)
+            for chunk in 0..4096 {
+                let base_word = chunk * 64;
+                for j in 0..32 {
+                    cipher.encrypt_block(&mut block);
+                    let block_ptr = block.as_ptr() as *const i64;
+                    let w0 = unsafe { block_ptr.read_unaligned() };
+                    let w1 = unsafe { block_ptr.add(1).read_unaligned() };
+                    unsafe {
+                        *sp_ptr.add(base_word + j * 2) = w0;
+                        *sp_ptr.add(base_word + j * 2 + 1) = w1;
+                    }
+                    fold64[j * 2] ^= w0;
+                    fold64[j * 2 + 1] ^= w1;
+                }
             }
         } else {
             // v2.1: Native AES-256-CTR keystream expansion (encrypting 2MB zeroes)
@@ -310,7 +332,8 @@ impl CortexRandomX {
 
             match op_code {
                 0 => {
-                    r[dst_idx] = r[dst_idx].wrapping_add(scratchpad[mem_idx]);
+                    let m = unsafe { *sp_ptr.add(mem_idx) };
+                    r[dst_idx] = r[dst_idx].wrapping_add(m);
                 }
                 1 => {
                     r[dst_idx] = r[dst_idx].wrapping_sub(r[src_idx]);
@@ -332,7 +355,12 @@ impl CortexRandomX {
                     r[dst_idx] = ((sr as u64) << shift | (right as u64)) as i64;
                 }
                 5 => {
-                    scratchpad[mem_idx] = r[dst_idx] ^ (iter as i64);
+                    let old_val = unsafe { *sp_ptr.add(mem_idx) };
+                    let new_val = r[dst_idx] ^ (iter as i64);
+                    unsafe { *sp_ptr.add(mem_idx) = new_val; }
+                    if is_v22 {
+                        fold64[mem_idx & 63] ^= old_val ^ new_val;
+                    }
                 }
                 6 => {
                     f[dst_idx & 3] += f[src_idx & 3];
@@ -346,9 +374,11 @@ impl CortexRandomX {
                 }
                 8 => {
                     let next_mem = (mem_idx + 64) & mask;
-                    let temp = scratchpad[mem_idx];
-                    scratchpad[mem_idx] = scratchpad[next_mem];
-                    scratchpad[next_mem] = temp;
+                    unsafe {
+                        let temp = *sp_ptr.add(mem_idx);
+                        *sp_ptr.add(mem_idx) = *sp_ptr.add(next_mem);
+                        *sp_ptr.add(next_mem) = temp;
+                    }
                 }
                 9 => {
                     r[dst_idx] = r[dst_idx].wrapping_neg();
@@ -362,12 +392,6 @@ impl CortexRandomX {
         let h1: [u8; 32] = Sha256::digest(&final_buf).into();
 
         if is_v22 {
-            let mut fold64 = [0i64; 64];
-            for i in (0..words).step_by(64) {
-                for j in 0..64 {
-                    fold64[j] ^= scratchpad[i + j];
-                }
-            }
             let mut sponge_hasher = Sha256::new();
             sponge_hasher.update(&h1);
             let fold_bytes: &[u8; 512] = unsafe {
@@ -514,7 +538,7 @@ fn main() {
     while i < args.len() {
         match args[i].as_str() {
             "--node" | "-n" | "-o" if i + 1 < args.len() => { pool_url = args[i + 1].clone(); i += 2; }
-            "--address" | "-a" | "-u" if i + 1 < args.len() => { address = args[i + 1].clone(); i += 2; }
+            "--address" | "--wallet" | "-a" | "-u" if i + 1 < args.len() => { address = args[i + 1].clone(); i += 2; }
             "--worker" | "-w" if i + 1 < args.len() => { worker = args[i + 1].clone(); worker_from_cli = true; i += 2; }
             "--threads" | "-t" if i + 1 < args.len() => {
                 if let Ok(n) = args[i + 1].parse() { num_threads = n; }
@@ -620,7 +644,7 @@ fn main() {
     }
 
     println!("===========================================================");
-    println!("  ⚡ PowGrid Reticulum AI ($RAIX) High-Performance CPU Miner v2.2");
+    println!("  ⚡ PowGrid Reticulum AI ($RAIX) High-Performance CPU Miner v2.2.2");
     println!("  Threads Allocated   : {}", num_threads);
     println!("  Micro-Architecture  : AVX2 + Hardware SHA-NI + AES-NI Accelerated");
     println!("  RandomX Hard Fork   : v1 (32KB), v2.1 (2MB CTR), & v2.2 Titan-CPU (2MB CBC + Sponge Fold)");
@@ -774,17 +798,19 @@ fn main() {
         thread::sleep(Duration::from_millis(200));
     }
 
-    // Register signal handler for Ctrl+C cursor restoration
+    // Register signal handlers for terminal restoration and window resize
     unsafe {
         libc::signal(libc::SIGINT, sigint_handler as usize);
         libc::signal(libc::SIGTERM, sigint_handler as usize);
+        #[cfg(unix)]
+        libc::signal(libc::SIGWINCH, sigwinch_handler as usize);
     }
 
     let initial_diff = active_job.read().unwrap().difficulty;
     event_logger.log(format!("\x1b[1;36m► MINER STARTED\x1b[0m   {} threads active | Diff: {:.2}", num_threads, initial_diff));
 
-    // Clear screen, scrollback and hide cursor for flicker-free static UI
-    print!("\x1b[2J\x1b[3J\x1b[H\x1b[?25l");
+    // Switch to alternate screen buffer (\x1b[?1049h), disable autowrap (\x1b[?7l), clear screen, cursor home, hide cursor (\x1b[?25l)
+    print!("\x1b[?1049h\x1b[?7l\x1b[2J\x1b[H\x1b[?25l");
     let _ = io::stdout().flush();
 
     // Reporter thread (Fixed static dashboard, 1s refresh, zero flicker)
@@ -808,14 +834,16 @@ fn main() {
         thread::spawn(move || {
             let mut last_hashes = 0u64;
             let mut last_time = Instant::now();
+            let mut hs_smooth = 0.0f64;
 
             while running.load(Ordering::Relaxed) {
-                thread::sleep(Duration::from_secs(1));
+                thread::sleep(Duration::from_millis(1000));
                 let now = Instant::now();
                 let elapsed = (now - last_time).as_secs_f64();
                 let curr_hashes = total_hashes.load(Ordering::Relaxed);
                 let delta = curr_hashes.saturating_sub(last_hashes);
-                let hs_instant = if elapsed > 0.0 { delta as f64 / elapsed } else { 0.0 };
+                let raw_instant = if elapsed > 0.0 { delta as f64 / elapsed } else { 0.0 };
+                hs_smooth = if hs_smooth == 0.0 { raw_instant } else { hs_smooth * 0.7 + raw_instant * 0.3 };
 
                 last_hashes = curr_hashes;
                 last_time = now;
@@ -823,10 +851,11 @@ fn main() {
                 let total_elapsed = start_time.elapsed().as_secs_f64();
                 let hs_avg = if total_elapsed > 0.0 { curr_hashes as f64 / total_elapsed } else { 0.0 };
 
-                let (now_str, now_unit) = format_speed(hs_instant);
+                let (now_str, now_unit) = format_speed(hs_smooth);
                 let (avg_str, avg_unit) = format_speed(hs_avg);
 
-                let diff = active_job.read().unwrap().difficulty;
+                let job = active_job.read().unwrap();
+                let diff = job.difficulty;
                 let acc = accepted_shares.load(Ordering::Relaxed);
                 let rej = rejected_shares.load(Ordering::Relaxed);
                 let blocks = blocks_found.load(Ordering::Relaxed);
@@ -849,14 +878,18 @@ fn main() {
                 };
 
                 let mut buf = String::with_capacity(4096);
-                buf.push_str("\x1b[H"); // Cursor home (Row 1, Col 1)
+                if RESIZE_EVENT.swap(false, Ordering::Relaxed) {
+                    buf.push_str("\x1b[2J\x1b[H"); // Full redraw on terminal resize
+                } else {
+                    buf.push_str("\x1b[H"); // Zero-flicker cursor home
+                }
 
                 let border_top = format!("╭{}╮\x1b[K\n", "─".repeat(76));
                 let border_div = format!("├{}┤\x1b[K\n", "─".repeat(76));
                 let border_bot = format!("╰{}╯\x1b[K\n", "─".repeat(76));
 
                 buf.push_str(&border_top);
-                buf.push_str(&box_row("\x1b[1;36m► POWGRID RETICULUM AI ($RAIX) HIGH-PERFORMANCE CPU MINER v1.1\x1b[0m", 74));
+                buf.push_str(&box_row("\x1b[1;36m► POWGRID RETICULUM AI ($RAIX) HIGH-PERFORMANCE CPU MINER v2.2.2\x1b[0m", 74));
                 buf.push_str(&two_col_row(
                     &format!("\x1b[90mPool:\x1b[0m \x1b[1;37m{}\x1b[0m", pool_display),
                     41,
@@ -871,14 +904,28 @@ fn main() {
                 ));
                 buf.push_str(&border_div);
                 buf.push_str(&box_row("\x1b[1;35mHARDWARE & ENGINE CONFIGURATION\x1b[0m", 74));
+                let is_v22 = job.seed.windows(4).any(|w| w == b"v2.2");
+                let is_v2 = is_v22 || job.seed.windows(2).any(|w| w == b"v2");
+                let algo_name = if is_v22 {
+                    "Titan-CPU v2.2 (AES-CBC)"
+                } else if is_v2 {
+                    "RandomX-Cortex v2.1 (CTR)"
+                } else {
+                    "Cortex-RandomX (L1 Fast)"
+                };
+                let sp_name = if is_v2 {
+                    "2 MB/core (L2/L3 SoA)"
+                } else {
+                    "32 KB/core (L1 Fast)"
+                };
                 buf.push_str(&two_col_row(
-                    "\x1b[90mAlgorithm :\x1b[0m Cortex-RandomX (L1 Fast)",
+                    &format!("\x1b[90mAlgorithm :\x1b[0m {}", algo_name),
                     41,
                     &format!("\x1b[90mThreads :\x1b[0m \x1b[1;37m{:>2} Cores [AVX2+SHA-NI]\x1b[0m", num_threads),
                     74
                 ));
                 buf.push_str(&two_col_row(
-                    "\x1b[90mScratchpad:\x1b[0m 32 KB/core (L1 Zero-RAM)",
+                    &format!("\x1b[90mScratchpad:\x1b[0m {}", sp_name),
                     41,
                     "\x1b[90mAccuracy:\x1b[0m \x1b[1;32m100% Bit-Perfect Match\x1b[0m",
                     74
@@ -1001,8 +1048,8 @@ fn main() {
                 }
 
                 if let Some(ref p_seed) = precomputed_seed {
-                    // Batch 2500 hashes per core loop
-                    for _ in 0..2500 {
+                    // Batch 50 hashes per core loop for smooth real-time telemetry on v2.2
+                    for _ in 0..50 {
                         let n_len = write_u64_ascii(nonce, &mut header_buf[p_len..]);
                         header_buf[p_len + n_len..p_len + n_len + s_len].copy_from_slice(&suffix);
                         let total_len = p_len + n_len + s_len;
@@ -1052,7 +1099,7 @@ fn main() {
                         }
                         nonce += 1;
                     }
-                    total_hashes.fetch_add(2500, Ordering::Relaxed);
+                    total_hashes.fetch_add(50, Ordering::Relaxed);
                 }
 
                 if throttle > 0 {
@@ -1065,6 +1112,9 @@ fn main() {
     for h in handles {
         let _ = h.join();
     }
+
+    print!("\x1b[?7h\x1b[?25h\x1b[?1049l\x1b[0m\n\n  \x1b[1;33m[SHUTDOWN]\x1b[0m Miner stopped safely. Terminal restored.\n\n");
+    let _ = io::stdout().flush();
 }
 
 fn run_benchmark(num_threads: usize, bench_secs: u64) {
@@ -1075,7 +1125,7 @@ fn run_benchmark(num_threads: usize, bench_secs: u64) {
     let running = Arc::new(AtomicBool::new(true));
 
     let base_header = "36042:0000000000abcdef1234567890:1789260000:merkle123:mem123:6:".as_bytes().to_vec();
-    let seed = b"reticulum-randomx-v2-epoch-17".to_vec();
+    let seed = b"reticulum-randomx-v2.2-epoch-18".to_vec();
 
     let mut handles = Vec::new();
     let start_time = Instant::now();
