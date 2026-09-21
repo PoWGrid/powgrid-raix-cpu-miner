@@ -21,3 +21,7 @@ Cargo.lock
 
 # Logs
 *.log
+
+# Archives
+*.tar.gz
+*.zip

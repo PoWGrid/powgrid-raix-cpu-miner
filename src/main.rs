@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
@@ -13,6 +13,7 @@ use aes::cipher::{BlockEncrypt, KeyInit, KeyIvInit, StreamCipher};
 type Aes256Ctr128BE = ctr::Ctr128BE<aes::Aes256>;
 
 static RESIZE_EVENT: AtomicBool = AtomicBool::new(false);
+static IS_HIVEOS: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn sigwinch_handler(_: libc::c_int) {
     RESIZE_EVENT.store(true, Ordering::Relaxed);
@@ -20,7 +21,11 @@ extern "C" fn sigwinch_handler(_: libc::c_int) {
 
 // Signal handler to restore terminal and exit alternate screen on Ctrl+C / SIGINT
 extern "C" fn sigint_handler(_: libc::c_int) {
-    print!("\x1b[?7h\x1b[?25h\x1b[?1049l\x1b[0m\n\n  \x1b[1;33m[SHUTDOWN]\x1b[0m Miner stopped safely. Terminal restored.\n\n");
+    if !IS_HIVEOS.load(Ordering::Relaxed) {
+        print!("\x1b[?7h\x1b[?25h\x1b[?1049l\x1b[0m\n\n  \x1b[1;33m[SHUTDOWN]\x1b[0m Miner stopped safely. Terminal restored.\n\n");
+    } else {
+        println!("\n  [SHUTDOWN] Miner stopped safely.");
+    }
     let _ = io::stdout().flush();
     std::process::exit(0);
 }
@@ -138,11 +143,15 @@ impl EventLogger {
 
     pub fn log(&self, msg: String) {
         let now_str = current_time_str();
+        let formatted = format!("\x1b[90m[{}]\x1b[0m {}", now_str, msg);
+        if IS_HIVEOS.load(Ordering::Relaxed) {
+            println!("{}", formatted);
+        }
         let mut q = self.events.lock().unwrap();
         if q.len() >= self.max_events {
             q.pop_front();
         }
-        q.push_back(format!("\x1b[90m[{}]\x1b[0m {}", now_str, msg));
+        q.push_back(formatted);
     }
 
     pub fn get_events(&self) -> Vec<String> {
@@ -501,6 +510,22 @@ struct ActiveJob {
 //  MAIN APPLICATION & MINING LOOP
 // =========================================================================
 
+fn resolve_ipv4_first(addr: &str) -> io::Result<Vec<std::net::SocketAddr>> {
+    use std::net::ToSocketAddrs;
+    let addrs = addr.to_socket_addrs()?;
+    let mut v4 = Vec::new();
+    let mut v6 = Vec::new();
+    for a in addrs {
+        if a.is_ipv4() {
+            v4.push(a);
+        } else {
+            v6.push(a);
+        }
+    }
+    v4.extend(v6);
+    Ok(v4)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -535,9 +560,10 @@ fn main() {
 
     let mut i = 1;
     let mut worker_from_cli = false;
+    let mut force_hiveos = false;
     while i < args.len() {
         match args[i].as_str() {
-            "--node" | "-n" | "-o" if i + 1 < args.len() => { pool_url = args[i + 1].clone(); i += 2; }
+            "--pool" | "--node" | "-n" | "-o" if i + 1 < args.len() => { pool_url = args[i + 1].clone(); i += 2; }
             "--address" | "--wallet" | "-a" | "-u" if i + 1 < args.len() => { address = args[i + 1].clone(); i += 2; }
             "--worker" | "-w" if i + 1 < args.len() => { worker = args[i + 1].clone(); worker_from_cli = true; i += 2; }
             "--threads" | "-t" if i + 1 < args.len() => {
@@ -548,6 +574,7 @@ fn main() {
                 if let Ok(ms) = args[i + 1].parse() { throttle_ms = ms; }
                 i += 2;
             }
+            "--hiveos" => { force_hiveos = true; i += 1; }
             "--solve" if i + 5 < args.len() => {
                 let prefix = args[i + 1].clone();
                 let suffix = args[i + 2].clone();
@@ -642,6 +669,9 @@ fn main() {
             _ => { i += 1; }
         }
     }
+
+    let is_hiveos = force_hiveos || !std::io::stdout().is_terminal();
+    IS_HIVEOS.store(is_hiveos, Ordering::Relaxed);
 
     println!("===========================================================");
     println!("  ⚡ PowGrid Reticulum AI ($RAIX) High-Performance CPU Miner v2.2.2");
@@ -750,6 +780,7 @@ fn main() {
 
         thread::spawn(move || {
             let agent = ureq::AgentBuilder::new()
+                .resolver(resolve_ipv4_first)
                 .timeout(Duration::from_secs(5))
                 .build();
             let template_url = format!("{}/api/pool/template?address={}&worker={}", pool_url, address, worker);
@@ -809,9 +840,11 @@ fn main() {
     let initial_diff = active_job.read().unwrap().difficulty;
     event_logger.log(format!("\x1b[1;36m► MINER STARTED\x1b[0m   {} threads active | Diff: {:.2}", num_threads, initial_diff));
 
-    // Switch to alternate screen buffer (\x1b[?1049h), disable autowrap (\x1b[?7l), clear screen, cursor home, hide cursor (\x1b[?25l)
-    print!("\x1b[?1049h\x1b[?7l\x1b[2J\x1b[H\x1b[?25l");
-    let _ = io::stdout().flush();
+    if !is_hiveos {
+        // Switch to alternate screen buffer (\x1b[?1049h), disable autowrap (\x1b[?7l), clear screen, cursor home, hide cursor (\x1b[?25l)
+        print!("\x1b[?1049h\x1b[?7l\x1b[2J\x1b[H\x1b[?25l");
+        let _ = io::stdout().flush();
+    }
 
     // Reporter thread (Fixed static dashboard, 1s refresh, zero flicker)
     {
@@ -834,6 +867,7 @@ fn main() {
         thread::spawn(move || {
             let mut last_hashes = 0u64;
             let mut last_time = Instant::now();
+            let mut last_log_time = Instant::now() - Duration::from_secs(10);
             let mut hs_smooth = 0.0f64;
 
             while running.load(Ordering::Relaxed) {
@@ -870,6 +904,33 @@ fn main() {
 
                 let eff_kh = (hs_avg / (num_threads as f64)) / 1000.0;
                 let events = event_logger.get_events();
+
+                if is_hiveos {
+                    let stats_payload = format!(
+                        r#"{{"uptime":{},"hashrate_avg":{},"accepted":{},"rejected":{}}}"#,
+                        uptime_secs,
+                        hs_smooth as u64,
+                        acc,
+                        rej
+                    );
+                    let _ = fs::write("/tmp/powgrid_miner_stats.json", &stats_payload);
+                    let _ = fs::write("/tmp/powgrid_cpu_miner_stats.json", &stats_payload);
+
+                    if last_log_time.elapsed() >= Duration::from_secs(5) {
+                        last_log_time = Instant::now();
+                        println!(
+                            "[{:02}:{:02}:{:02}] ⛏️  Speed: {:>6.2} {:<4} | Shares: {}/{} | Blocks: {} | Diff: {:.2} | Threads: {} | Worker: {}",
+                            u_h, u_m, u_s,
+                            now_str, now_unit,
+                            acc, rej,
+                            blocks,
+                            diff,
+                            num_threads,
+                            worker_name
+                        );
+                    }
+                    continue;
+                }
 
                 let blocks_str = if blocks > 0 {
                     format!("\x1b[1;93m★ {} BLOCK{}\x1b[0m", blocks, if blocks > 1 { "S" } else { "" })
@@ -999,6 +1060,7 @@ fn main() {
 
         handles.push(thread::spawn(move || {
             let agent = ureq::AgentBuilder::new()
+                .resolver(resolve_ipv4_first)
                 .timeout(Duration::from_secs(5))
                 .build();
             let submit_url = format!("{}/api/pool/submit", pool_url);
@@ -1113,7 +1175,11 @@ fn main() {
         let _ = h.join();
     }
 
-    print!("\x1b[?7h\x1b[?25h\x1b[?1049l\x1b[0m\n\n  \x1b[1;33m[SHUTDOWN]\x1b[0m Miner stopped safely. Terminal restored.\n\n");
+    if !is_hiveos {
+        print!("\x1b[?7h\x1b[?25h\x1b[?1049l\x1b[0m\n\n  \x1b[1;33m[SHUTDOWN]\x1b[0m Miner stopped safely. Terminal restored.\n\n");
+    } else {
+        println!("\n  [SHUTDOWN] Miner stopped safely.");
+    }
     let _ = io::stdout().flush();
 }
 
