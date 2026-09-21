@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
-use aes::cipher::{KeyIvInit, StreamCipher};
+use aes::cipher::{BlockEncrypt, KeyInit, KeyIvInit, StreamCipher};
 
 type Aes256Ctr128BE = ctr::Ctr128BE<aes::Aes256>;
 
@@ -151,6 +151,7 @@ impl EventLogger {
 
 #[derive(Clone)]
 pub struct PrecomputedSeed {
+    pub is_v22: bool,
     pub is_v2: bool,
     pub seed: Vec<u8>,
     pub colon_seed: Vec<u8>,
@@ -159,7 +160,11 @@ pub struct PrecomputedSeed {
 
 impl PrecomputedSeed {
     pub fn new(seed: &[u8]) -> Self {
-        let is_v2 = seed.windows(2).any(|w| w == b"v2")
+        let is_v22 = seed.windows(4).any(|w| w == b"v2.2")
+            || seed.windows(22).any(|w| w == b"reticulum-randomx-v2.2");
+
+        let is_v2 = is_v22
+            || seed.windows(2).any(|w| w == b"v2")
             || seed.windows(20).any(|w| w == b"reticulum-randomx-v2");
 
         let mut colon_seed = Vec::with_capacity(seed.len() + 1);
@@ -171,6 +176,7 @@ impl PrecomputedSeed {
         hasher.update(b":");
 
         Self {
+            is_v22,
             is_v2,
             seed: seed.to_vec(),
             colon_seed,
@@ -183,6 +189,7 @@ pub struct CortexRandomX;
 
 impl CortexRandomX {
     pub const FORK_BLOCK_HEIGHT: u64 = 36040;
+    pub const FORK_V2_2_BLOCK_HEIGHT: u64 = 37825;
     pub const SCRATCHPAD_WORDS_V1: usize = 4096;   // 32 KB
     pub const SCRATCHPAD_WORDS_V2: usize = 262144; // 2 MB
     pub const VM_ITERATIONS_V1: usize = 64;
@@ -191,7 +198,9 @@ impl CortexRandomX {
 
     pub fn get_seed_for_block(block_index: u64) -> String {
         let epoch = block_index / Self::EPOCH_BLOCKS;
-        if block_index >= Self::FORK_BLOCK_HEIGHT {
+        if block_index >= Self::FORK_V2_2_BLOCK_HEIGHT {
+            format!("reticulum-randomx-v2.2-epoch-{}", epoch)
+        } else if block_index >= Self::FORK_BLOCK_HEIGHT {
             format!("reticulum-randomx-v2-epoch-{}", epoch)
         } else {
             format!("cortex-randomx-epoch-{}", epoch)
@@ -206,6 +215,7 @@ impl CortexRandomX {
 
     #[inline(always)]
     pub fn hash_fast(header: &[u8], precomputed: &PrecomputedSeed, scratchpad: &mut [i64]) -> [u8; 32] {
+        let is_v22 = precomputed.is_v22;
         let is_v2 = precomputed.is_v2;
         let words = if is_v2 { Self::SCRATCHPAD_WORDS_V2 } else { Self::SCRATCHPAD_WORDS_V1 };
         let iterations = if is_v2 { Self::VM_ITERATIONS_V2 } else { Self::VM_ITERATIONS_V1 };
@@ -230,6 +240,32 @@ impl CortexRandomX {
                 for chunk in 1..8 {
                     scratchpad[base + chunk * 8..base + chunk * 8 + 8].copy_from_slice(&next_words);
                 }
+            }
+        } else if is_v22 {
+            // v2.2 Titan-CPU Hardware AES-256-CBC Chained Sequential Fill
+            let mut seed_hasher = Sha256::new();
+            seed_hasher.update(header);
+            seed_hasher.update(b":");
+            seed_hasher.update(&precomputed.seed);
+            let seed_key: [u8; 32] = seed_hasher.finalize().into();
+
+            let mut iv_hasher = Sha256::new();
+            iv_hasher.update(&precomputed.seed);
+            iv_hasher.update(b":");
+            iv_hasher.update(header);
+            iv_hasher.update(b":v2.2-iv");
+            let iv_full: [u8; 32] = iv_hasher.finalize().into();
+            let iv: [u8; 16] = iv_full[0..16].try_into().unwrap();
+
+            let cipher = aes::Aes256::new(&seed_key.into());
+            let mut block = aes::Block::from(iv);
+
+            for b in 0..131072 {
+                cipher.encrypt_block(&mut block);
+                let w0 = i64::from_le_bytes(block[0..8].try_into().unwrap());
+                let w1 = i64::from_le_bytes(block[8..16].try_into().unwrap());
+                scratchpad[b * 2] = w0;
+                scratchpad[b * 2 + 1] = w1;
             }
         } else {
             // v2.1: Native AES-256-CTR keystream expansion (encrypting 2MB zeroes)
@@ -325,13 +361,29 @@ impl CortexRandomX {
         let final_buf: [u8; 64] = unsafe { std::mem::transmute(r) };
         let h1: [u8; 32] = Sha256::digest(&final_buf).into();
 
-        let mut sponge_hasher = Sha256::new();
-        sponge_hasher.update(&h1);
-        let scratchpad_bytes: &[u8; 512] = unsafe {
-            &*(scratchpad.as_ptr() as *const [u8; 512])
-        };
-        sponge_hasher.update(scratchpad_bytes);
-        sponge_hasher.finalize().into()
+        if is_v22 {
+            let mut fold64 = [0i64; 64];
+            for i in (0..words).step_by(64) {
+                for j in 0..64 {
+                    fold64[j] ^= scratchpad[i + j];
+                }
+            }
+            let mut sponge_hasher = Sha256::new();
+            sponge_hasher.update(&h1);
+            let fold_bytes: &[u8; 512] = unsafe {
+                &*(fold64.as_ptr() as *const [u8; 512])
+            };
+            sponge_hasher.update(fold_bytes);
+            sponge_hasher.finalize().into()
+        } else {
+            let mut sponge_hasher = Sha256::new();
+            sponge_hasher.update(&h1);
+            let scratchpad_bytes: &[u8; 512] = unsafe {
+                &*(scratchpad.as_ptr() as *const [u8; 512])
+            };
+            sponge_hasher.update(scratchpad_bytes);
+            sponge_hasher.finalize().into()
+        }
     }
 }
 
@@ -568,13 +620,13 @@ fn main() {
     }
 
     println!("===========================================================");
-    println!("  ⚡ PowGrid Reticulum AI ($RAIX) High-Performance CPU Miner v2.1");
+    println!("  ⚡ PowGrid Reticulum AI ($RAIX) High-Performance CPU Miner v2.2");
     println!("  Threads Allocated   : {}", num_threads);
     println!("  Micro-Architecture  : AVX2 + Hardware SHA-NI + AES-NI Accelerated");
-    println!("  RandomX Hard Fork   : Dual v1 (32KB) & v2.1 (2MB AES-CTR Keystream)");
+    println!("  RandomX Hard Fork   : v1 (32KB), v2.1 (2MB CTR), & v2.2 Titan-CPU (2MB CBC + Sponge Fold)");
     println!("===========================================================\n");
 
-    // Self-test: Canonical Genesis Vector (Nonce 123), High-Nonce Vector (Nonce 99999), and v2.1 Vector
+    // Self-test: Canonical Genesis Vector (Nonce 123), High-Nonce Vector (Nonce 99999), v2.1 Vector, and v2.2 Titan-CPU Vector
     let mut test_scratchpad = vec![0i64; CortexRandomX::SCRATCHPAD_WORDS_V2];
     let test_header = b"test_header_123";
     let test_seed = b"cortex-randomx-genesis-seed-v1";
@@ -593,11 +645,17 @@ fn main() {
     let test_v2_hex = hex::encode(test_v2_hash);
     let expected_v2 = "896e700fe13c24909b95c77e833a2dc0492ed4cbcd2c296bcb387b55e46ee4f6";
 
+    let test_v22_header = b"test_header";
+    let test_v22_seed = b"reticulum-randomx-v2.2-epoch-18";
+    let test_v22_hash = CortexRandomX::hash(test_v22_header, test_v22_seed, &mut test_scratchpad);
+    let test_v22_hex = hex::encode(test_v22_hash);
+    let expected_v22 = "3cd08324ba2bbc688fce17a99a6badf185ca8d285f09350c6fbfbf3e17c2ca88";
+
     print!("[SELF-TEST] Cryptographic L1 accuracy check: ");
-    if test_hex == expected_123 && test_hex_99k == expected_99999 && test_v2_hex == expected_v2 {
-        println!("✅ 100% BIT-PERFECT MATCH (v1 & v2.1 Hard Fork Vectors)\n");
+    if test_hex == expected_123 && test_hex_99k == expected_99999 && test_v2_hex == expected_v2 && test_v22_hex == expected_v22 {
+        println!("✅ 100% BIT-PERFECT MATCH (v1, v2.1 & v2.2 Titan-CPU Hard Fork Vectors)\n");
     } else {
-        println!("❌ MISMATCH!\n  Expected 123: {}\n  Got: {}\n  Expected 99k: {}\n  Got: {}\n  Expected v2: {}\n  Got: {}", expected_123, test_hex, expected_99999, test_hex_99k, expected_v2, test_v2_hex);
+        println!("❌ MISMATCH!\n  Expected 123: {}\n  Got: {}\n  Expected 99k: {}\n  Got: {}\n  Expected v2: {}\n  Got: {}\n  Expected v22: {}\n  Got: {}", expected_123, test_hex, expected_99999, test_hex_99k, expected_v2, test_v2_hex, expected_v22, test_v22_hex);
         std::process::exit(1);
     }
 
@@ -1137,5 +1195,15 @@ mod tests {
         let hash = CortexRandomX::hash(header, seed, &mut scratchpad);
         let expected = "896e700fe13c24909b95c77e833a2dc0492ed4cbcd2c296bcb387b55e46ee4f6";
         assert_eq!(hex::encode(hash), expected, "v2.1 vector mismatch!");
+    }
+
+    #[test]
+    fn test_v22_exact_vector() {
+        let mut scratchpad = vec![0i64; CortexRandomX::SCRATCHPAD_WORDS_V2];
+        let header = b"test_header";
+        let seed = b"reticulum-randomx-v2.2-epoch-18";
+        let hash = CortexRandomX::hash(header, seed, &mut scratchpad);
+        let expected = "3cd08324ba2bbc688fce17a99a6badf185ca8d285f09350c6fbfbf3e17c2ca88";
+        assert_eq!(hex::encode(hash), expected, "v2.2 vector mismatch!");
     }
 }
