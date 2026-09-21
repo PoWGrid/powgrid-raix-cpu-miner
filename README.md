@@ -24,9 +24,17 @@ No compilation or build tools required — download official precompiled package
 
 | Platform | Architecture | Download Link | Quick Launch |
 | :--- | :--- | :--- | :--- |
+| **HiveOS** | Linux x86_64 | [📥 powgrid-raix-cpu-miner-hiveos.tar.gz](https://github.com/PoWGrid/powgrid-raix-cpu-miner/releases/latest/download/powgrid-raix-cpu-miner-hiveos.tar.gz) | Custom Miner URL |
 | **Windows** | x86_64 / x64 | [📥 powgrid-raix-cpu-miner-windows-x64.zip](https://github.com/PoWGrid/powgrid-raix-cpu-miner/releases/latest/download/powgrid-raix-cpu-miner-windows-x64.zip) | Double-click `start_mining.bat` |
 | **Linux** | x86_64 | [📥 powgrid-raix-cpu-miner-linux-x64.tar.gz](https://github.com/PoWGrid/powgrid-raix-cpu-miner/releases/latest/download/powgrid-raix-cpu-miner-linux-x64.tar.gz) | `./powgrid-raix-cpu-miner` |
 | **macOS** | Apple Silicon & Intel | [📥 powgrid-raix-miner-macos.zip](https://github.com/PoWGrid/powgrid-raix-cpu-miner/releases/latest/download/powgrid-raix-miner-macos.zip) | `./powgrid-raix-miner` |
+
+### 🐝 HiveOS Custom Miner Quick Setup:
+- **Miner name:** `powgrid-raix-cpu-miner`
+- **Installation URL:** `https://github.com/PoWGrid/powgrid-raix-cpu-miner/releases/download/v2.2.2/powgrid-raix-cpu-miner-hiveos.tar.gz`
+- **Hash algorithm:** `randomx`
+- **Wallet and worker template:** `%WAL%` | **Pool URL:** `https://raix.powgrid.xyz`
+- **Extra config arguments (optional):** `--threads 16`
 
 > 🔗 You can also find individual `.exe` files, checksums, and previous versions on the **[Releases Page](https://github.com/PoWGrid/powgrid-raix-cpu-miner/releases)**.
 
